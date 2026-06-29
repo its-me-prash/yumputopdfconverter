@@ -6,47 +6,51 @@ password-protected ones) into a folder so a tool — or a human, or Claude —
 can open each page and analyse the content. Building a single PDF is an
 optional, secondary step (``--pdf``).
 
-Accepts a full Yumpu reader URL, including the ``?password=`` query parameter
-used by protected documents, e.g.::
+This is a "bundle" of the techniques used across the open-source Yumpu
+downloaders (see CREDITS.md):
+
+* json2 metadata endpoint to learn the real image base path, per-page image
+  names and page count (from ianmuscat/yumpu-scraper) — no guessing.
+* img.yumpu.com page-image scheme + ImageMagick PDF build (from the C++
+  YumpuToPDFConverter lineage).
+* Password handling, content validation and fail-loud auth (added here).
+
+Usage::
 
     python3 yumpu_to_pdf/yumpu_to_pdf.py \\
         "https://www.yumpu.com/de/document/read/71073502/expose-17614/29?password=baurimmo"
 
-Password flow
+Download flow
 -------------
-Protected Yumpu documents are gated by a form page at
-``/<lang>/document/protected/password/<id>?redirect=<reader-path>``. This
-script:
-
-1. Visits the reader URL with a cookie-aware client and a browser User-Agent.
-2. If that redirects to (or returns) the protection page, it parses the
-   password form and POSTs the password — carrying any hidden fields
-   (CSRF token, ``redirect``) — so Yumpu sets the access cookie.
-3. Confirms access was actually granted (fails loudly otherwise).
-4. Scrapes the reader page for the real page-image URL pattern and page
-   count, instead of guessing.
-5. Downloads each page, validating it is a real image (not an HTML error or
-   placeholder), into the output folder.
-6. Optionally merges the pages into a PDF (``--pdf``).
+1. Authenticate (handles the /document/protected/password/ gate, POSTs the
+   password, fails loudly if rejected).
+2. Query ``https://www.yumpu.com/document/json2/<id>`` for ``base_path`` +
+   ``pages[].images.large`` + ``pages[].qss.large`` and build exact image
+   URLs. (Primary path — works for any document without guessing.)
+3. Fall back to scraping the reader page / the hardcoded img.yumpu.com scheme
+   if the metadata endpoint is unavailable.
+4. Download each page, validating it is a real image (magic bytes), into the
+   output folder.
+5. Optionally merge into a PDF (``--pdf``).
 
 Only the Python standard library is needed to download. Building a PDF uses
 ImageMagick's ``convert`` if present, otherwise Pillow if installed.
 
-NOTE: The exact protection flow could not be verified against the live site
-from the development sandbox (Yumpu hosts are blocked by egress policy there).
-The form-POST handling and page scraping are defensive and fall back to
-explicit ``--dimensions`` / ``--image`` / ``--pages`` flags if auto-detection
-fails. Run it where ``www.yumpu.com`` / ``img.yumpu.com`` are reachable.
+NOTE: The exact protection flow and the json2 response shape could not be
+verified against the live site from the development sandbox (Yumpu hosts are
+blocked by egress policy there). The code is defensive, with manual overrides
+(``--dimensions`` / ``--image`` / ``--pages``) as a fallback. Run it where
+``www.yumpu.com`` / ``img.yumpu.com`` are reachable.
 """
 
 import argparse
 import html
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
-import tempfile
 from http.cookiejar import CookieJar
 from urllib.parse import urlparse, parse_qs, urlencode, urljoin
 from urllib.request import build_opener, HTTPCookieProcessor, HTTPRedirectHandler, Request
@@ -60,11 +64,9 @@ USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
-# Magic-byte signatures so we never save an HTML error page as a "page image".
 IMAGE_SIGNATURES = (
     b"\xff\xd8\xff",            # JPEG
     b"\x89PNG\r\n\x1a\n",       # PNG
-    b"RIFF",                    # WebP (RIFF....WEBP)
     b"GIF8",                    # GIF
 )
 
@@ -87,7 +89,6 @@ def parse_yumpu_url(url):
     query = parse_qs(parsed.query)
     password = query.get("password", [None])[0]
 
-    # Path looks like /de/document/read/71073502/expose-17614/29
     match = re.search(r"/document/(?:read|view|protected/password)/(\d+)(?:/([^/?#]+))?",
                       parsed.path)
     if not match:
@@ -109,22 +110,26 @@ def make_opener():
     return opener, redirect
 
 
-def _get(opener, url, data=None):
-    """GET/POST and return (final_url, status, body_text)."""
+def _request(opener, url, data=None, binary=False):
+    """GET/POST. Returns (final_url, status, body) where body is bytes if
+    binary else decoded text."""
     req = Request(url, data=data)
     with opener.open(req, timeout=30) as resp:
-        body = resp.read()
+        raw = resp.read()
+        if binary:
+            return resp.geturl(), resp.status, raw
         charset = resp.headers.get_content_charset() or "utf-8"
-        return resp.geturl(), resp.status, body.decode(charset, errors="replace")
+        return resp.geturl(), resp.status, raw.decode(charset, errors="replace")
 
+
+# --------------------------------------------------------------------------
+# Authentication (password-protected documents)
+# --------------------------------------------------------------------------
 
 def _find_password_form(body_html, base_url):
-    """Locate the password <form> and return (action_url, fields_dict)."""
-    # Find a form that contains a password input.
     for form in re.finditer(r"<form\b[^>]*>(.*?)</form>", body_html,
                             re.IGNORECASE | re.DOTALL):
-        block = form.group(0)
-        inner = form.group(1)
+        block, inner = form.group(0), form.group(1)
         if not re.search(r'<input[^>]*type=["\']?password', inner, re.IGNORECASE):
             continue
         action_match = re.search(r'action=["\']([^"\']*)["\']', block, re.IGNORECASE)
@@ -158,14 +163,14 @@ def authenticate(opener, redirect, url, password):
     """
     redirect.chain.clear()
     try:
-        final_url, status, body = _get(opener, url)
+        final_url, status, body = _request(opener, url)
     except HTTPError as exc:
         final_url, status, body = exc.geturl(), exc.code, ""
     except URLError as exc:
         raise SystemExit(f"Error: could not reach Yumpu ({exc.reason}).")
 
     if not _looks_like_password_page(final_url, body):
-        return body  # already have access (public doc or query param sufficed)
+        return body  # public doc, or query param already sufficed
 
     if not password:
         raise SystemExit(
@@ -175,62 +180,99 @@ def authenticate(opener, redirect, url, password):
 
     action_url, fields = _find_password_form(body, final_url)
     if not action_url:
-        # Fall back to the canonical protection endpoint with a redirect field.
         doc_id, _, _ = parse_yumpu_url(url)
         parsed = urlparse(url)
-        action_url = (
-            f"{parsed.scheme}://{parsed.netloc}"
-            f"/{parsed.path.split('/')[1]}/document/protected/password/{doc_id}"
-        )
+        lang = parsed.path.split("/")[1] if parsed.path.count("/") > 1 else "en"
+        action_url = (f"{parsed.scheme}://{parsed.netloc}"
+                      f"/{lang}/document/protected/password/{doc_id}")
         fields = {"redirect": parsed.path}
 
-    # Set the password into whichever field name the form uses.
     pw_field = next((k for k in fields if k.lower() == "password"), "password")
     fields[pw_field] = password
 
-    post_data = urlencode(fields).encode("utf-8")
     redirect.chain.clear()
     try:
-        final_url, status, body = _get(opener, action_url, data=post_data)
+        final_url, status, body = _request(opener, action_url,
+                                           data=urlencode(fields).encode("utf-8"))
     except HTTPError as exc:
         final_url, status, body = exc.geturl(), exc.code, ""
     except URLError as exc:
         raise SystemExit(f"Error: password POST failed ({exc.reason}).")
 
     if _looks_like_password_page(final_url, body):
-        raise SystemExit(
-            "Error: password was rejected (still on the protection page). "
-            "Check the password."
-        )
+        raise SystemExit("Error: password was rejected (still on the protection "
+                         "page). Check the password.")
     return body
 
 
-def discover_image_pattern(reader_html, doc_id):
-    """Scrape the reader HTML for the real (dimensions, image_name) and an
-    upper bound on the page count. Returns (dimensions, image_name, pages)
-    with None for anything not found."""
-    dims = image_name = pages = None
+# --------------------------------------------------------------------------
+# Page discovery
+# --------------------------------------------------------------------------
 
+def fetch_metadata_urls(opener, doc_id):
+    """PRIMARY: use the json2 metadata endpoint to build exact page-image URLs.
+
+    Returns a list of full image URLs, or None if the endpoint is unavailable
+    or the response doesn't have the expected shape.
+    Technique adapted from ianmuscat/yumpu-scraper.
+    """
+    url = f"https://www.yumpu.com/document/json2/{doc_id}"
+    try:
+        _, _, body = _request(opener, url)
+    except (HTTPError, URLError):
+        return None
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return None
+
+    base = data.get("base_path") or data.get("basePath")
+    pages = data.get("pages")
+    if not base or not isinstance(pages, list) or not pages:
+        return None
+    if base.startswith("//"):
+        base = "https:" + base
+
+    urls = []
+    for pg in pages:
+        images = pg.get("images") or {}
+        img = images.get("large") or images.get("medium") or images.get("small")
+        if not img:
+            return None
+        qss = (pg.get("qss") or {})
+        token = qss.get("large") or qss.get("medium") or qss.get("small") or ""
+        full = urljoin(base if base.endswith("/") else base + "/", img.lstrip("/"))
+        if token:
+            full += ("&" if "?" in full else "?") + token
+        urls.append(full)
+    return urls or None
+
+
+def discover_image_pattern(reader_html, doc_id):
+    """FALLBACK: scrape the reader HTML for (dimensions, image_name, pages)."""
+    dims = image_name = pages = None
     m = re.search(
         rf"img\.yumpu\.com/{doc_id}/\d+/([0-9]+x[0-9]*)/([^\"'?\s]+\.(?:jpg|jpeg|png|webp))",
         reader_html, re.IGNORECASE,
     )
     if m:
         dims, image_name = m.group(1), m.group(2)
-
     pm = re.search(r'"(?:number_of_pages|pages|page_count)"\s*:\s*(\d+)', reader_html)
     if pm:
         pages = int(pm.group(1))
-
     return dims, image_name, pages
 
 
-def image_url(doc_id, page, dimensions, image_name, password):
+def pattern_url(doc_id, page, dimensions, image_name, password):
     base = f"https://img.yumpu.com/{doc_id}/{page}/{dimensions}/{image_name}"
     if password:
         return base + "?" + urlencode({"password": password})
     return base
 
+
+# --------------------------------------------------------------------------
+# Download + PDF
+# --------------------------------------------------------------------------
 
 def is_image(data):
     return data.startswith(IMAGE_SIGNATURES) or (
@@ -238,25 +280,40 @@ def is_image(data):
     )
 
 
-def download_pages(opener, doc_id, dimensions, image_name, password, pages, outdir):
+def _save_page(opener, url, filename):
+    _, _, data = _request(opener, url, binary=True)
+    if not is_image(data):
+        raise ValueError("response was not an image (auth/placeholder?)")
+    with open(filename, "wb") as fh:
+        fh.write(data)
+
+
+def download_from_urls(opener, urls, outdir):
+    files = []
+    for idx, url in enumerate(urls, start=1):
+        filename = os.path.join(outdir, f"page{idx:04d}.jpg")
+        print(f"=== Downloading page {idx}/{len(urls)} ===")
+        try:
+            _save_page(opener, url, filename)
+            files.append(filename)
+        except (HTTPError, URLError, ValueError) as exc:
+            reason = getattr(exc, "code", None) or getattr(exc, "reason", exc)
+            print(f"Warning: page {idx} failed ({reason}).", file=sys.stderr)
+    return files
+
+
+def download_by_pattern(opener, doc_id, dimensions, image_name, password, pages, outdir):
     files = []
     consecutive_failures = 0
     page = 1
     limit = pages if pages else MAX_PAGES
-
+    ext = os.path.splitext(image_name)[1] or ".jpg"
     while page <= limit:
-        url = image_url(doc_id, page, dimensions, image_name, password)
-        ext = os.path.splitext(image_name)[1] or ".jpg"
+        url = pattern_url(doc_id, page, dimensions, image_name, password)
         filename = os.path.join(outdir, f"page{page:04d}{ext}")
         print(f"=== Downloading page {page} ===")
         try:
-            req = Request(url)
-            with opener.open(req, timeout=30) as resp:
-                data = resp.read()
-            if not is_image(data):
-                raise ValueError("response was not an image (auth/placeholder?)")
-            with open(filename, "wb") as fh:
-                fh.write(data)
+            _save_page(opener, url, filename)
             files.append(filename)
             consecutive_failures = 0
         except (HTTPError, URLError, ValueError) as exc:
@@ -267,7 +324,6 @@ def download_pages(opener, doc_id, dimensions, image_name, password, pages, outd
                 print("Reached the end of the document.", file=sys.stderr)
                 break
         page += 1
-
     return files
 
 
@@ -278,28 +334,29 @@ def merge_to_pdf(files, output):
     try:
         from PIL import Image
     except ImportError:
-        raise SystemExit(
-            "Error: need ImageMagick's 'convert' on PATH or Pillow installed "
-            "(pip install pillow) to build the PDF."
-        )
+        raise SystemExit("Error: need ImageMagick's 'convert' on PATH or Pillow "
+                         "installed (pip install pillow) to build the PDF.")
     images = [Image.open(f).convert("RGB") for f in files]
     images[0].save(output, save_all=True, append_images=images[1:])
 
 
+# --------------------------------------------------------------------------
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Download a Yumpu document's pages (for reading/analysis); "
-        "optionally build a PDF."
-    )
+        "optionally build a PDF.")
     parser.add_argument("url", nargs="?",
                         help="Full Yumpu reader URL, may contain ?password=<pw>")
     parser.add_argument("-d", "--doc-id", help="Yumpu document id (instead of a URL)")
     parser.add_argument("--password", help="Document password (overrides the URL's)")
     parser.add_argument("-p", "--pages", type=int, default=0,
-                        help="Exact page count (default: auto-detect)")
-    parser.add_argument("-s", "--dimensions", help="Image dimensions segment override")
-    parser.add_argument("-i", "--image", help="Image file-name segment override")
-    parser.add_argument("--outdir", help="Folder to store the page images "
+                        help="Exact page count for the fallback path (default: auto)")
+    parser.add_argument("-s", "--dimensions", help="Fallback image dimensions override")
+    parser.add_argument("-i", "--image", help="Fallback image file-name override")
+    parser.add_argument("--no-metadata", action="store_true",
+                        help="Skip the json2 metadata endpoint, force the fallback")
+    parser.add_argument("--outdir", help="Folder for the page images "
                         "(default: ./<slug-or-id>_pages)")
     parser.add_argument("--pdf", nargs="?", const=True, default=False,
                         help="Also build a PDF (optionally give a file name)")
@@ -320,37 +377,40 @@ def main(argv=None):
     os.makedirs(outdir, exist_ok=True)
 
     opener, redirect = make_opener()
-
-    dimensions = args.dimensions
-    image_name = args.image
-    pages = args.pages
-
+    reader_html = ""
     if reader_url:
         reader_html = authenticate(opener, redirect, reader_url, password)
+
+    files = []
+    # PRIMARY path: json2 metadata endpoint.
+    if not args.no_metadata:
+        meta_urls = fetch_metadata_urls(opener, doc_id)
+        if meta_urls:
+            print(f"Metadata: {len(meta_urls)} page(s) from json2 endpoint.")
+            files = download_from_urls(opener, meta_urls, outdir)
+
+    # FALLBACK path: scrape pattern / hardcoded scheme.
+    if not files:
         d_dims, d_name, d_pages = discover_image_pattern(reader_html, doc_id)
-        dimensions = dimensions or d_dims
-        image_name = image_name or d_name
-        pages = pages or (d_pages or 0)
-        if d_dims or d_name or d_pages:
-            print(f"Detected: dimensions={d_dims} image={d_name} pages={d_pages}")
+        dimensions = args.dimensions or d_dims or DEFAULT_DIMENSIONS
+        image_name = args.image or d_name or DEFAULT_IMAGE_NAME
+        pages = args.pages or (d_pages or 0)
+        print(f"Fallback: dimensions={dimensions} image={image_name} "
+              f"pages={pages or 'auto'}")
+        files = download_by_pattern(opener, doc_id, dimensions, image_name,
+                                    password, pages, outdir)
 
-    dimensions = dimensions or DEFAULT_DIMENSIONS
-    image_name = image_name or DEFAULT_IMAGE_NAME
-
-    files = download_pages(opener, doc_id, dimensions, image_name, password, pages, outdir)
     if not files:
         raise SystemExit(
-            "Error: no pages downloaded. Likely an auth failure or a wrong "
-            "image pattern. Try passing --dimensions / --image explicitly, and "
-            "verify the password."
-        )
+            "Error: no pages downloaded. Likely an auth failure or wrong image "
+            "pattern. Verify the password, or pass --dimensions / --image.")
 
     print(f"\nDownloaded {len(files)} page(s) to: {outdir}")
-    print("You can now open the images in that folder to read/analyse the document.")
+    print("Open the images in that folder to read/analyse the document.")
 
     if args.pdf:
-        output = args.pdf if isinstance(args.pdf, str) else f"{slug or doc_id}.pdf"
-        output = os.path.abspath(output)
+        output = os.path.abspath(args.pdf if isinstance(args.pdf, str)
+                                 else f"{slug or doc_id}.pdf")
         print(f"Building PDF: {output} ...")
         merge_to_pdf(files, output)
         print(f"Done: {output}")

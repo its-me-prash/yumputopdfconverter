@@ -44,6 +44,17 @@ python3 yumpu_to_pdf/yumpu_to_pdf.py "<url>?password=<pw>" --outdir ./doc --pdf 
    (answer the user's question, summarise, extract data, etc.).
 4. Only build a PDF (`--pdf`) if the user actually wants a PDF artefact.
 
+### How page discovery works
+
+The engine bundles the approaches of the open-source Yumpu downloaders (see
+`CREDITS.md`). Its **primary** path queries the metadata endpoint
+`https://www.yumpu.com/document/json2/<id>` to get the real image `base_path`,
+per-page image names and page count, then builds exact image URLs — no
+guessing. If that endpoint is unavailable it **falls back** to scraping the
+reader page / the `img.yumpu.com/<id>/<page>/<dims>/<name>` scheme (use
+`--no-metadata` to force the fallback, and `--dimensions` / `--image` /
+`--pages` to override it).
+
 ### How the password flow works
 
 Protected Yumpu documents are gated by a form page at
@@ -67,9 +78,10 @@ Protected Yumpu documents are gated by a form page at
 | `url` (positional) | Full Yumpu reader URL (may contain `?password=`) | — |
 | `-d`, `--doc-id ID` | Document id (instead of a URL) | — |
 | `--password PW` | Document password (overrides the URL's) | from URL |
-| `-p`, `--pages N` | Exact page count | auto-detect |
-| `-s`, `--dimensions WxH` | Image dimensions segment override | auto-detect → `1215x1600` |
-| `-i`, `--image NAME` | Image file-name segment override | auto-detect → `composicion-escrita.jpg` |
+| `-p`, `--pages N` | Exact page count (fallback path) | auto-detect |
+| `-s`, `--dimensions WxH` | Image dimensions segment (fallback) | auto → `1215x1600` |
+| `-i`, `--image NAME` | Image file-name segment (fallback) | auto → `composicion-escrita.jpg` |
+| `--no-metadata` | Skip the json2 endpoint, force the fallback | off |
 | `--outdir DIR` | Folder for the page images | `./<slug-or-id>_pages` |
 | `--pdf [FILE]` | Also build a PDF (optional file name) | off |
 
