@@ -61,9 +61,23 @@ DEFAULT_IMAGE_NAME = "composicion-escrita.jpg"
 MAX_PAGES = 1000
 STOP_AFTER_CONSECUTIVE_FAILURES = 3
 USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
+# Browser-like headers so img.yumpu.com / the reader don't reject us as a bot.
+# (Note: these only matter once the connection is allowed — they do NOT and
+# cannot bypass a proxy/egress CONNECT denial.)
+BROWSER_HEADERS = [
+    ("User-Agent", USER_AGENT),
+    ("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,"
+               "image/avif,image/webp,image/apng,*/*;q=0.8"),
+    ("Accept-Language", "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7"),
+    ("Referer", "https://www.yumpu.com/"),
+    ("Sec-Fetch-Dest", "document"),
+    ("Sec-Fetch-Mode", "navigate"),
+    ("Sec-Fetch-Site", "same-origin"),
+    ("Upgrade-Insecure-Requests", "1"),
+]
 IMAGE_SIGNATURES = (
     b"\xff\xd8\xff",            # JPEG
     b"\x89PNG\r\n\x1a\n",       # PNG
@@ -106,7 +120,7 @@ def parse_yumpu_url(url):
 def make_opener():
     redirect = _RecordingRedirect()
     opener = build_opener(HTTPCookieProcessor(CookieJar()), redirect)
-    opener.addheaders = [("User-Agent", USER_AGENT)]
+    opener.addheaders = list(BROWSER_HEADERS)
     return opener, redirect
 
 
