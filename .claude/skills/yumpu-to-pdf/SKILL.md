@@ -1,28 +1,75 @@
 ---
 name: yumpu-to-pdf
-description: Download the pages of a Yumpu document (img.yumpu.com) and merge them into a single PDF. Use when the user wants to convert, download, or archive a Yumpu publication / magazine / document as a PDF, or gives a Yumpu document id or yumpu.com link.
+description: Download the pages of a Yumpu document (img.yumpu.com) and merge them into a single PDF, including password-protected documents. Use when the user wants to convert, download, or archive a Yumpu publication / magazine / document as a PDF, or gives a Yumpu document id or yumpu.com link (with or without a ?password= parameter).
 ---
 
 # Yumpu to PDF
 
 Convert a Yumpu document into a single PDF by downloading each page image
-from `img.yumpu.com` and merging them with ImageMagick.
+from `img.yumpu.com` and merging them.
 
 ## When to use
 
 Use this skill when the user wants to turn a Yumpu publication into a PDF,
 mentions a Yumpu document id, or pastes a `yumpu.com` / `img.yumpu.com` link.
+This includes **password-protected** documents — the user's link will contain
+a `?password=…` query parameter.
 
-## Requirements
+## Recommended engine: Python (supports passwords + full URLs)
 
-The script shells out to two tools that must be on `PATH`:
+`yumpu_to_pdf/yumpu_to_pdf.py` (at the repo root) accepts a full Yumpu reader
+URL, including the `?password=` parameter used by protected documents, and
+auto-detects the page count.
+
+```sh
+# Password-protected document — pass the full reader URL
+python3 yumpu_to_pdf/yumpu_to_pdf.py \
+    "https://www.yumpu.com/de/document/read/71073502/expose-17614?password=baurimmo"
+
+# Public document
+python3 yumpu_to_pdf/yumpu_to_pdf.py "https://www.yumpu.com/en/document/view/62283426/slug"
+
+# By id, with an explicit password and page count
+python3 yumpu_to_pdf/yumpu_to_pdf.py -d 71073502 --password baurimmo -p 24 -o expose.pdf
+```
+
+How the password support works: the script uses a cookie-aware opener, visits
+the reader URL first so Yumpu validates the password and sets the access
+cookie, then forwards the password to each `img.yumpu.com` page request.
+
+Python engine options:
+
+| Flag | Meaning | Default |
+| --- | --- | --- |
+| `url` (positional) | Full Yumpu reader URL (may contain `?password=`) | — |
+| `-d`, `--doc-id ID` | Document id (instead of a URL) | — |
+| `--password PW` | Document password (overrides the URL's) | from URL |
+| `-p`, `--pages N` | Exact page count | auto-detect |
+| `-s`, `--dimensions WxH` | Image dimensions segment | `1215x1600` |
+| `-i`, `--image NAME` | Image file-name segment | `composicion-escrita.jpg` |
+| `-o`, `--output FILE` | Output PDF file name | `<slug>.pdf` / `<id>.pdf` |
+| `-w`, `--workdir DIR` | Temp directory for JPGs | fresh temp dir |
+| `-k`, `--keep` | Keep the downloaded JPGs | off |
+
+Requirements for the Python engine: `python3` (standard library only for the
+download) plus either ImageMagick's `convert` on `PATH` or Pillow
+(`pip install pillow`) to build the PDF.
+
+## Simple Bash engine (no password support)
+
+For public documents you can also use the dependency-light Bash script. It has
+no password handling — use the Python engine for protected documents.
+
+### Requirements
+
+The Bash script shells out to two tools that must be on `PATH`:
 
 - `curl` — downloads the page images.
 - `convert` — ImageMagick, merges the images into a PDF.
 
 If `convert` is missing, install ImageMagick first.
 
-## How to run
+### How to run
 
 The engine is `scripts/yumpu_to_pdf.sh`. All parameters have defaults and can
 be overridden with flags:
